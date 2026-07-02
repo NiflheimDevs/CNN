@@ -1,0 +1,46 @@
+Phase 1 — Grammar (NNGraph.g4)
+This is the phase worth the most up-front thought, because grammar mistakes are expensive to unwind later.
+Key design call: don't hardcode layer type names as grammar keywords. Treat Linear, Conv2d, Softmax, etc. as plain identifiers at the parser level, and validate the known-type set in the semantic analyzer against a lookup table. Section 9 of your spec wants macros and reusable subgraphs eventually — if Linear etc. are lexer keywords, adding a user-defined layer type later means touching the grammar. Keeping them as identifiers means Phase 9 extensions are pure semantic-analyzer changes.
+Value/shape ambiguity is smaller than it looks. Scalars are always bare (in_features=784), shapes are always parenthesized (normalized_shape=(128), tensor(3, 224, 224)). So:
+value : INT | FLOAT | STRING | BOOL | NONE_ | shape ;
+shape : '(' INT (',' INT)* ')' ;
+A bare (128) only ever matches shape (single-element tuple) since plain INT never appears wrapped in parens as a value alternative. No real ambiguity — just make sure your codegen for scalar-vs-shape params handles the "shape of length 1" case (e.g. LayerNorm(normalized_shape=(128)) should emit nn.LayerNorm(128), unwrapping single-element tuples where PyTorch expects a scalar).
+Rules to write: program, model, graphBlock, configBlock, nodeDecl, edgeDecl (with optional '[' 'label' '=' STRING ']'), paramList, value. Comments and whitespace go on a skip channel in the lexer, not the parser.
+Phase 2 — AST construction
+Plain dataclasses (Model, Node, Edge, Config, Program), populated by visitor overrides. Convert literals to native Python types in the visitor (parse "0.3" → float, strip quotes, build real tuples) — don't let semantic analysis or codegen ever touch raw ANTLR context objects. This decouples the rest of your pipeline from ANTLR internals, same as you'd want a separate IR in the EVM compiler.
+Propagate ctx.start.line into every AST node now — you'll need it for every diagnostic message in Phase 3/5, and it's much more annoying to retrofit later.
+Phase 3 — Semantic analysis
+Order matters because later checks assume earlier ones passed:
+
+Unique node IDs → build the symbol table (id → Node)
+Undefined edge references → check against the symbol table
+Orphan nodes → every non-input/output node appears in ≥1 edge
+Build adjacency list from edges
+Cycle detection → 3-color DFS (white/gray/black), same technique you'd use for any DAG validation
+Input/output reachability → BFS/DFS forward from the input node
+Residual arity → count incoming edges per Residual() node, must be exactly 2
+Parameter type/schema check → a LAYER_SCHEMA table: {"Linear": {"in_features": int, "out_features": int, "bias": (bool, optional)}, ...}, validated per node
+
+Don't fail fast. Accumulate a list of Diagnostic(severity, line, message, hint) and report everything at once — your spec's own error examples show Errors and Warnings coexisting in one compile run, which only works if you collect rather than throw-on-first.
+Open design question you should resolve before Phase 4, not during it: how does codegen know which of a Residual() node's two incoming edges is the "shortcut" vs the "main path"? The worked example uses edge x -> skip [label="shortcut"] and the generated code does identity = x before the main branch starts. I'd make the label the authoritative signal (fall back to a hard error demanding an explicit label if ambiguous) rather than trying to infer it structurally — structural inference on arbitrary graphs is fragile and will bite you on any topology the spec's four examples didn't cover.
+Phase 4 — Code generation (the meaty part)
+
+Topological sort: Kahn's algorithm (in-degree counting), but with ties broken by original node-declaration order so output is deterministic and stable across runs — otherwise two semantically-identical graphs could emit differently-ordered forward() bodies depending on dict iteration order.
+Fan-out pass first: before emitting anything, count outgoing edges per node. Nodes with out-degree > 1 must be bound to a named variable (per §6.2's a = .../b = ... pattern) since their output is consumed more than once; out-degree-1 nodes can just be threaded through inline if you want tighter code, though matching the spec's examples exactly means always naming them by node id.
+Binding table: as you walk topo order, maintain node_id → expression_string. Multi-input nodes (Add, Concat, Residual, and eventually anything with fan-in > 1) gather predecessor expressions in edge-declaration order and apply the §6.3 template.
+__init__ emission: iterate nodes in declaration order, not topo order — your Inception example's __init__ matches source order, not execution order — and skip the structural ops (Add/Concat/Residual/Split) since they're stateless and have no nn.Module to register.
+Templating choice: given the output shape is fixed (always one nn.Module subclass, __init__ + forward + optional __main__ guard), Jinja2 string templates will be far less code than building a real ast.Module and calling ast.unparse(). Save the AST-building approach for if you ever need guaranteed-valid-Python-under-arbitrary-composition — you don't have that requirement here.
+
+Phase 5 — Diagnostics
+Subclass ANTLR's ErrorListener, override syntaxError() to stop the default stderr dump and instead push into your Diagnostic list — same object type semantic analysis uses, so the CLI has one uniform sink to sort-by-line and print. Codegen only runs if zero ERROR-level diagnostics exist; warnings (orphan nodes) don't block it.
+Phase 6 — CLI & pipeline wiring
+nngraph_compiler.py: CharStream → Lexer → CommonTokenStream → Parser → parse tree → Visitor → AST → semantic analyzer → (gate on diagnostics) → codegen → write file. For the "optionally validate" step in §8.3, prefer ast.parse() on the generated source over actually importing it — importing executes module-level code (harmless here, but it's the wrong tool: you want a syntax check, not an execution).
+Phase 7 — Testing
+
+Your four worked examples are golden tests for free — compile the .nng, then compare ast.dump() of the generated code against ast.dump() of the expected code, not raw text diff (formatting shouldn't fail a test, semantics should).
+One negative fixture per semantic rule in §5, asserting the diagnostic message matches §7's format exactly (undefined ref, cycle, wrong arity, type mismatch, orphan).
+Independent parser-only tests for grammar edge cases (nested comments, trailing commas, missing labels).
+If you want to go further: Hypothesis-generated random DAGs to fuzz topo-sort + codegen for crashes, independent of correctness.
+
+Phase 9 — Stretch goals (design hooks now, build later)
+Not urgent, but cheap to keep open: give LAYER_SCHEMA entries an optional shape_fn field now (unused) so shape inference later is a new pass reading that table, not a rewrite of it. Keep codegen.py's interface as generate(ast) -> str so ONNX export / Graphviz rendering / training-scaffold generation can be added as sibling backends consuming the same validated AST rather than forking the pipeline.

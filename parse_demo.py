@@ -17,10 +17,10 @@ can build on top with confidence.
 import sys
 
 from antlr4 import CommonTokenStream, FileStream
-from generated.NNGraphLexer import NNGraphLexer
-from generated.NNGraphParser import NNGraphParser
+from gen.NNGraphLexer import NNGraphLexer
+from gen.NNGraphParser import NNGraphParser
 
-from src.nngraph.ast_builder import ASTBuilder
+from nngraph.ast_builder import ASTBuilder
 
 
 def main(path: str) -> None:
@@ -41,7 +41,5 @@ def main(path: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(f"usage: python3 {sys.argv[0]} <path-to.nng>")
-        sys.exit(1)
-    main(sys.argv[1])
+    path = "./mlp.nng"
+    main(path)

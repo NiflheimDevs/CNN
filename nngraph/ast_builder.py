@@ -14,10 +14,10 @@ Requires the parser to already be generated:
 
 import re
 
-from generated.NNGraphParser import NNGraphParser
-from generated.NNGraphVisitor import NNGraphVisitor
+from gen.NNGraphParser import NNGraphParser
+from gen.NNGraphVisitor import NNGraphVisitor
 
-from .ast_nodes import Config, Edge, Graph, GraphNode, InputDecl, Model, Program
+from nngraph.ast_nodes import Config, Edge, Graph, GraphNode, InputDecl, Model, Program
 
 _ESCAPES = {'"': '"', "\\": "\\", "n": "\n", "t": "\t", "r": "\r"}
 
