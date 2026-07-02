@@ -22,6 +22,61 @@ from gen.NNGraphParser import NNGraphParser
 
 from nngraph.ast_builder import ASTBuilder
 
+def show_ast(ast_root_node):
+    import networkx as nx
+    from matplotlib import pyplot as plt
+    from networkx.drawing.nx_pydot import graphviz_layout
+
+    graph = transform_ast_to_networkx(ast_root_node)
+    pos = graphviz_layout(graph, prog="dot")
+    nx.draw(graph, pos, node_size=500, labels=nx.get_node_attributes(graph, "label"),
+            alpha=0.5, node_color="cyan", with_labels=True)
+    ax = plt.gca()
+    ax.margins(0.20)
+    plt.axis("off")
+    plt.show()
+
+
+def transform_ast_to_networkx(node):
+    """Convert AST nodes to NetworkX graph for visualization."""
+    import networkx as nx
+    from dataclasses import is_dataclass, fields
+
+    G = nx.DiGraph()
+    node_counter = [0]
+
+    def add_node_recursive(obj, parent_id=None):
+        current_id = node_counter[0]
+        node_counter[0] += 1
+
+        # Determine label
+        if is_dataclass(obj):
+            label = type(obj).__name__
+        elif isinstance(obj, list):
+            label = f"List[{len(obj)}]"
+        else:
+            label = str(obj)
+
+        G.add_node(current_id, label=label)
+
+        if parent_id is not None:
+            G.add_edge(parent_id, current_id)
+
+        # Recurse into structure
+        if is_dataclass(obj):
+            for field in fields(obj):
+                child = getattr(obj, field.name)
+                if child is not None:
+                    add_node_recursive(child, current_id)
+        elif isinstance(obj, list):
+            for item in obj:
+                add_node_recursive(item, current_id)
+
+        return current_id
+
+    add_node_recursive(node)
+    return G
+
 
 def main(path: str) -> None:
     char_stream = FileStream(path, encoding="utf-8")
@@ -38,6 +93,8 @@ def main(path: str) -> None:
 
     program = ASTBuilder().visit(tree)
     print(program)
+
+    show_ast(program)
 
 
 if __name__ == "__main__":
