@@ -1,0 +1,27 @@
+model MLP {
+ input x : tensor(784)
+ output out
+}
+
+graph {
+ node fc1 : Linear(in_features=784, out_features=256)
+ node relu1 : ReLU()
+ node drop1 : Dropout(p=0.3)
+ node fc2 : Linear(in_features=256, out_features=128)
+ node relu2 : ReLU()
+ node fc3 : Linear(in_features=128, out_features=10)
+ node out : Softmax(dim=1)
+
+ edge x -> fc1
+ edge fc1 -> relu1
+ edge relu1 -> drop1
+ edge drop1 -> fc2
+ edge fc2 -> relu2
+ edge relu2 -> fc3
+ edge fc3 -> out
+}
+
+config {
+ batch_size = 64
+ device = "cuda"
+}
