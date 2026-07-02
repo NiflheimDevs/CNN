@@ -21,6 +21,7 @@ from gen.NNGraphLexer import NNGraphLexer
 from gen.NNGraphParser import NNGraphParser
 
 from nngraph.ast_builder import ASTBuilder
+from nngraph.semantic_analyzer import SemanticAnalyzer
 
 def show_ast(ast_root_node):
     import networkx as nx
@@ -94,8 +95,14 @@ def main(path: str) -> None:
     program = ASTBuilder().visit(tree)
     print(program)
 
-    show_ast(program)
+    # show_ast(program)
 
+    errors = SemanticAnalyzer(program).analyze()
+    if errors:
+        for err in errors:
+            print(f"[semantic error] {err.message}"
+                  + (f" (line {err.line})" if err.line else ""), file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     path = "./mlp.nng"
