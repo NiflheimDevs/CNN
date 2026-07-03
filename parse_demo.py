@@ -22,6 +22,7 @@ from gen.NNGraphParser import NNGraphParser
 
 from nngraph.ast_builder import ASTBuilder
 from nngraph.semantic_analyzer import SemanticAnalyzer
+from nngraph.codegen import CodeGenerator
 
 def show_ast(ast_root_node):
     import networkx as nx
@@ -104,6 +105,11 @@ def main(path: str) -> None:
                   + (f" (line {err.line})" if err.line else ""), file=sys.stderr)
         sys.exit(1)
 
+    gencode = CodeGenerator(program).generate()
+
+    print (gencode)
+
+
 if __name__ == "__main__":
-    path = "./mlp.nng"
+    path = "./mlp4.nng"
     main(path)

@@ -3,7 +3,17 @@ nngraph/semantic_analyzer.py
 
 Phase 3: semantic analysis over the AST from ast_builder.py.
 Operates only on ast_nodes.py dataclasses (Program, Model, InputDecl,
-Graph, GraphNode, Edge, Config) — never touches ANTLR context objects.
+Graph, GraphNode, Edge, Config) -- never touches ANTLR context objects.
+
+CONTRACT WITH PHASE 4 (codegen.py): after analyze() returns an empty
+error list, every GraphNode.params dict in the program has already
+been rewritten to use PyTorch's own keyword-argument names, not the
+DSL's names. Renaming happens in _normalize_param_names(), the last
+step of analyze(). Codegen no longer needs to know that `in_ch` and
+`in_channels` are the same thing -- by the time it sees the AST, that
+distinction no longer exists. This is a deliberate front-end/back-end
+split: semantic analysis validates AND canonicalizes; codegen just
+translates a trusted, already-canonical AST.
 """
 
 from dataclasses import dataclass
@@ -34,8 +44,15 @@ class SemanticAnalyzer:
         self._check_orphans()
         self._check_residual_arity()
         self._check_param_types()
+        self._check_required_params()
         self._check_reachability()
         self._check_acyclic()
+        # Normalization runs last and unconditionally. Even if a node
+        # had an error (e.g. an unknown extra param), whatever known
+        # params it DOES have are still safe to rename -- the unknown
+        # ones are left untouched and harmless, since a caller is
+        # expected to gate codegen behind an empty error list anyway.
+        self._normalize_param_names()
         return self.errors
 
     # ---- Unique node IDs --------------------------------------------------
@@ -102,28 +119,99 @@ class SemanticAnalyzer:
                         f"Residual node '{node_id}' must have exactly "
                         f"2 incoming edges, found {count}", node_id, n.line))
 
-    # ---- Parameter type checking ----------------------------------------
+    # ---- Layer catalogue ---------------------------------------------------
+    # Keys and param names here match the DSL exactly as documented in
+    # Section 3.3-3.5 of the spec -- e.g. Conv2d's 'in_ch', not
+    # PyTorch's 'in_channels'. Validation happens in these terms
+    # deliberately, so error messages reference what the user actually
+    # typed. The DSL -> PyTorch rename only happens afterward, in
+    # _normalize_param_names().
     EXPECTED_PARAM_TYPES: dict[str, dict[str, type]] = {
+        # -- Layers (3.3) --
         "Linear": {"in_features": int, "out_features": int, "bias": bool},
-        "Conv2d": {"in_channels": int, "out_channels": int,
-                   "kernel_size": int, "stride": int, "padding": int},
+        "Conv2d": {"in_ch": int, "out_ch": int, "kernel": int,
+                   "stride": int, "padding": int},
+        "Conv1d": {"in_ch": int, "out_ch": int, "kernel": int, "stride": int},
+        "BatchNorm2d": {"num_features": int},
+        # normalized_shape is technically int-or-tuple in real PyTorch,
+        # but every worked example in the spec writes it as a shape
+        # literal -- (128) -- which parses to a 1-tuple in the AST, so
+        # `tuple` is what's actually checked here. A bare
+        # normalized_shape=128 would fail this check even though the
+        # grammar permits it; a known, narrow gap, not fixed here.
+        "LayerNorm": {"normalized_shape": tuple},
+        "MaxPool2d": {"kernel": int, "stride": int},
+        "AvgPool2d": {"kernel": int, "stride": int},
         "Dropout": {"p": float},
-        # extend per the spec's layer catalogue
+        "Flatten": {"start_dim": int, "end_dim": int},
+        "Embedding": {"num_embeddings": int, "embedding_dim": int},
+        "MultiHeadAttn": {"embed_dim": int, "num_heads": int},
+        "LSTM": {"input_size": int, "hidden_size": int, "num_layers": int},
+        "GRU": {"input_size": int, "hidden_size": int},
+        # -- Activations (3.4) --
+        "ReLU": {},
+        "Sigmoid": {},
+        "Tanh": {},
+        "GELU": {},
+        "Softmax": {"dim": int},
+        "LeakyReLU": {"negative_slope": float},
+        "ELU": {"alpha": float},
+        # -- Special ops (3.5) --
+        "Add": {},
+        "Concat": {"dim": int},
+        "Residual": {},
+        "Split": {"chunks": int, "dim": int},
     }
 
+    # Params listed in EXPECTED_PARAM_TYPES that are NOT required --
+    # anything for a given layer_type that's absent from this set (but
+    # present in EXPECTED_PARAM_TYPES) is required.
+    OPTIONAL_PARAMS: dict[str, set[str]] = {
+        "Linear": {"bias"},
+        "Flatten": {"start_dim", "end_dim"},
+        "LeakyReLU": {"negative_slope"},
+        "ELU": {"alpha"},
+    }
+
+    # DSL param name -> PyTorch kwarg name, only where they differ.
+    # Applied by _normalize_param_names() after validation succeeds.
+    PARAM_RENAME: dict[str, dict[str, str]] = {
+        "Conv2d": {"in_ch": "in_channels", "out_ch": "out_channels", "kernel": "kernel_size"},
+        "Conv1d": {"in_ch": "in_channels", "out_ch": "out_channels", "kernel": "kernel_size"},
+        "MaxPool2d": {"kernel": "kernel_size"},
+        "AvgPool2d": {"kernel": "kernel_size"},
+    }
+
+    # ---- Parameter type checking ----------------------------------------
     def _check_param_types(self):
         for node_id, n in self.nodes.items():
             expected = self.EXPECTED_PARAM_TYPES.get(n.layer_type)
-            if not expected:
+            if expected is None:
+                self.errors.append(SemanticError(
+                    f"Node '{node_id}' has undefined layer_type '{n.layer_type}'", node_id, n.line
+                ))
                 continue
             for name, value in n.params.items():
                 exp_type = expected.get(name)
                 if exp_type is None:
+                    self.errors.append(SemanticError(
+                        f"Node '{node_id}' has undefined parameter '{name}' for layer_type '{n.layer_type}'", node_id, n.line
+                    ))
                     continue
                 # bool is a subclass of int in Python -- guard against
                 # a bool literal silently passing an `int` param check.
                 if exp_type is int and isinstance(value, bool):
                     ok = False
+                # A float-typed param written as a bare whole number
+                # (p=0, alpha=1) lexes as INT under the grammar, not
+                # FLOAT -- there's no decimal point to trigger the
+                # FLOAT token. That's completely normal PyTorch usage,
+                # so widen int -> float here instead of rejecting it.
+                # (isinstance(True, int) is also True in Python, so
+                # this must explicitly exclude bool too, or a bool
+                # would silently satisfy a float-typed param as well.)
+                elif exp_type is float and isinstance(value, int) and not isinstance(value, bool):
+                    ok = True
                 else:
                     ok = isinstance(value, exp_type)
                 if not ok:
@@ -131,6 +219,33 @@ class SemanticAnalyzer:
                         f"Node '{node_id}': param '{name}' expected "
                         f"{exp_type.__name__}, got {type(value).__name__}",
                         node_id, n.line))
+
+    # ---- Required parameter presence ---------------------------------------
+    def _check_required_params(self):
+        for node_id, n in self.nodes.items():
+            expected = self.EXPECTED_PARAM_TYPES.get(n.layer_type)
+            if expected is None:
+                continue  # already reported by _check_param_types
+            optional = self.OPTIONAL_PARAMS.get(n.layer_type, set())
+            for param_name in expected:
+                if param_name in optional:
+                    continue
+                if param_name not in n.params:
+                    self.errors.append(SemanticError(
+                        f"Node '{node_id}' ({n.layer_type}) is missing "
+                        f"required parameter '{param_name}'", node_id, n.line))
+
+    # ---- DSL -> PyTorch parameter name normalization ------------------------
+    def _normalize_param_names(self):
+        """Rewrites every node's params dict in place so keys match
+        PyTorch's actual constructor kwargs. Runs last, after all
+        validation, so error messages above always reference the DSL
+        names the user actually wrote -- never the renamed ones."""
+        for n in self.nodes.values():
+            rename = self.PARAM_RENAME.get(n.layer_type)
+            if not rename:
+                continue
+            n.params = {rename.get(k, k): v for k, v in n.params.items()}
 
     # ---- Reachability ----------------------------------------------------
     def _check_reachability(self):

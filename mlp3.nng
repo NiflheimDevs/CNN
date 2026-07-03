@@ -1,0 +1,32 @@
+model InceptionBlock {
+    input  x : tensor(32, 56, 56) 
+    output out 
+} 
+ 
+graph { 
+    // Branch A — 1x1 conv 
+    node convA1 : Conv2d(in_ch=32, out_ch=16, kernel=1, stride=1, padding=0) 
+    node reluA  : ReLU()
+    // Branch B — 3x3 conv
+node convB1 : Conv2d(in_ch=32, out_ch=16, kernel=1, stride=1, padding=0)
+node convB2 : Conv2d(in_ch=16, out_ch=32, kernel=3, stride=1, padding=1)
+node reluB  : ReLU()
+// Merge branches
+node cat1   : Concat(dim=1)   // 16+32 = 48 channels
+node bn1
+: BatchNorm2d(num_features=48)
+node out
+: ReLU()
+// Branch A wiring
+edge x      -> convA1
+edge convA1 -> reluA
+// Branch B wiring
+edge x      -> convB1
+edge convB1 -> convB2
+edge convB2 -> reluB
+// Merge
+edge reluA  -> cat1
+edge reluB  -> cat1
+edge cat1   -> bn1
+edge bn1    -> out
+}
