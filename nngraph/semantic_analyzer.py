@@ -364,23 +364,37 @@ class SemanticAnalyzer:
         return visited
 
     # ---- Cycle detection (DAG check) --------------------------------------
-    def _check_acyclic(self):
-        WHITE, GRAY, BLACK = 0, 1, 2
-        color = {n: WHITE for n in self.adjacency}
+    def _check_acyclic(self) -> None:
+        """Cycle detection via Kahn's algorithm.
 
-        def visit(node_id):
-            color[node_id] = GRAY
+        As a side effect this also produces a valid topological order
+        (self._topo_order), which _run_shape_inference() reuses directly —
+        so we only ever run one O(V+E) pass instead of DFS-cycle-check +
+        separate Kahn's-topo-sort.
+        """
+        in_degree = {n: 0 for n in self.adjacency}
+        for src, neighbors in self.adjacency.items():
+            for dst in neighbors:
+                in_degree[dst] = in_degree.get(dst, 0) + 1
+
+        queue = [n for n, deg in in_degree.items() if deg == 0]
+        order: list[str] = []
+        while queue:
+            node_id = queue.pop(0)
+            order.append(node_id)
             for neighbor in self.adjacency.get(node_id, []):
-                if neighbor not in color:
-                    continue
-                if color[neighbor] == GRAY:
-                    self.errors.append(SemanticError(
-                        f"Cycle detected involving node '{neighbor}'",
-                        neighbor))
-                elif color[neighbor] == WHITE:
-                    visit(neighbor)
-            color[node_id] = BLACK
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
 
-        for node_id in self.adjacency:
-            if color[node_id] == WHITE:
-                visit(node_id)
+        if len(order) != len(self.adjacency):
+            # Every node still holding in-degree > 0 is part of, or only
+            # reachable through, a cycle.
+            stuck = [n for n in self.adjacency if n not in order]
+            for node_id in stuck:
+                self.errors.append(
+                    SemanticError(f"Cycle detected involving node '{node_id}'", node_id)
+                )
+            self._topo_order = None  # order is meaningless if a cycle exists
+        else:
+            self._topo_order = order
