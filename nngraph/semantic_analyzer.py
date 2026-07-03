@@ -18,6 +18,8 @@ translates a trusted, already-canonical AST.
 
 from dataclasses import dataclass
 from nngraph.ast_nodes import Program, GraphNode, Edge
+from nngraph.diagnostics import Diagnostic, Severity
+from nngraph.layer_catalogue import STRUCTURAL_OPS
 
 
 @dataclass
@@ -25,6 +27,7 @@ class SemanticError:
     message: str
     node_id: str | None = None
     line: int | None = None
+    severity: Severity = Severity.ERROR
 
 
 class SemanticAnalyzer:
@@ -43,6 +46,7 @@ class SemanticAnalyzer:
         self._check_output_resolves()
         self._check_orphans()
         self._check_residual_arity()
+        self._check_implicit_sum_fanin()
         self._check_param_types()
         self._check_required_params()
         self._check_reachability()
@@ -54,6 +58,42 @@ class SemanticAnalyzer:
         # expected to gate codegen behind an empty error list anyway.
         self._normalize_param_names()
         return self.errors
+
+    def to_diagnostics(self) -> list[Diagnostic]:
+        """Converts accumulated SemanticError objects into Diagnostic
+        objects, for unified reporting alongside Phase 1's syntax
+        errors -- same type, same sort_diagnostics(), same
+        has_errors() gate.
+
+        Best-effort location fallback: a few call sites above don't
+        currently thread a line through --
+        _check_output_resolves()'s error (the output id doesn't
+        resolve to anything, so there's no node to point at) and
+        _check_acyclic()'s cycle error (has a node_id but the
+        SemanticError(msg, neighbor) call only fills in message and
+        node_id, not line) both leave line=None on the SemanticError.
+        Rather than let those diagnostics render with no location at
+        all -- which the spec's Section 7 format never does, every
+        example shows "[line N]" -- this falls back to the referenced
+        node's own declared line when node_id is known, and to the
+        model block's line as a last resort when it isn't. This is
+        diagnostics doing best-effort reporting on data it didn't
+        create, not a substitute for threading the real line through
+        at the point each error is raised -- that's still the more
+        correct fix if you want to tighten it up in semantic_analyzer.py
+        itself later.
+        """
+        result = []
+        for err in self.errors:
+            line = err.line
+            if line is None and err.node_id is not None:
+                node = self.nodes.get(err.node_id)
+                if node is not None:
+                    line = node.line
+            if line is None:
+                line = self.program.model.line
+            result.append(Diagnostic(err.severity, line, err.message))
+        return result
 
     # ---- Unique node IDs --------------------------------------------------
     def _collect_nodes(self):
@@ -107,7 +147,8 @@ class SemanticAnalyzer:
             if node_id not in endpoints:
                 self.errors.append(SemanticError(
                     f"Node '{node_id}' is orphaned (not part of any edge)",
-                    node_id, self.nodes[node_id].line))
+                    node_id, self.nodes[node_id].line,
+                    severity=Severity.WARNING))
 
     # ---- Residual arity ------------------------------------------------
     def _check_residual_arity(self):
@@ -118,6 +159,47 @@ class SemanticAnalyzer:
                     self.errors.append(SemanticError(
                         f"Residual node '{node_id}' must have exactly "
                         f"2 incoming edges, found {count}", node_id, n.line))
+
+    # ---- Implicit-sum multi-input warning ----------------------------------
+    def _check_implicit_sum_fanin(self):
+        """A 'regular' (non-structural) layer with more than one
+        incoming edge is valid DSL, not a mistake by construction --
+        Section 4's Transformer Encoder example wires both
+        `drop1 -> norm1` and `x -> norm1` (a residual connection) into
+        a plain LayerNorm node, and its generated code sums them
+        before calling the layer: `x = self.norm1(x + attn_out)`. This
+        isn't stated as an explicit rule anywhere in Section 3/5/6's
+        prose -- it only shows up in that one worked example -- but
+        it's clearly intentional, and codegen.py treats it exactly
+        like Residual: sum every incoming edge, then apply the layer
+        to the sum.
+
+        It's also an easy thing to trigger by accident -- wiring a
+        second edge into a node you only meant to feed once -- so it's
+        surfaced as a WARNING rather than silently accepted. The DSL
+        author should know their layer is about to receive the
+        elementwise sum of two tensors, not "whichever edge got
+        declared last" or anything else that might be the more
+        intuitive assumption.
+
+        Shape/dimension compatibility between the summed tensors is
+        NOT checked here -- that requires actually tracking tensor
+        shapes through the graph, which this method doesn't do. See
+        the shape-inference design notes for where that's headed.
+        """
+        for node_id, n in self.nodes.items():
+            if n.layer_type in STRUCTURAL_OPS:
+                continue  # Add/Concat/Residual/Split already expect multiple inputs
+            count = self.incoming_count.get(node_id, 0)
+            if count > 1:
+                self.errors.append(SemanticError(
+                    f"Node '{node_id}' ({n.layer_type}) has {count} "
+                    f"incoming edges; they will be summed elementwise "
+                    f"before being passed to {n.layer_type}, the same "
+                    f"way a Residual node works. If that's not what you "
+                    f"intended, remove the extra edge or route it "
+                    f"through an explicit Add() or Concat() node instead.",
+                    node_id, n.line, severity=Severity.WARNING))
 
     # ---- Layer catalogue ---------------------------------------------------
     # Keys and param names here match the DSL exactly as documented in
@@ -186,6 +268,11 @@ class SemanticAnalyzer:
     def _check_param_types(self):
         for node_id, n in self.nodes.items():
             expected = self.EXPECTED_PARAM_TYPES.get(n.layer_type)
+            # Must be `is None`, not `not expected` -- ReLU, Add,
+            # Residual etc. are known layer types that legitimately
+            # map to an empty dict `{}`, which is also falsy in
+            # Python. `not expected` would incorrectly flag every
+            # zero-parameter layer type as unknown.
             if expected is None:
                 self.errors.append(SemanticError(
                     f"Node '{node_id}' has undefined layer_type '{n.layer_type}'", node_id, n.line

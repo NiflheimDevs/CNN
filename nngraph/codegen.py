@@ -30,6 +30,7 @@ confusing KeyError three lines later.
 import keyword
 
 from nngraph.ast_nodes import Edge, GraphNode, Program
+from nngraph.layer_catalogue import STRUCTURAL_OPS
 
 
 class CodegenError(Exception):
@@ -37,11 +38,6 @@ class CodegenError(Exception):
     Under the documented contract with semantic_analyzer.py, none of
     these should be reachable in practice -- see each raise site."""
 
-
-
-# Nodes with no backing nn.Module -- emitted as tensor-op expressions
-# inside forward(), never registered as a self.<id> submodule.
-STRUCTURAL_OPS = {"Add", "Concat", "Residual", "Split"}
 
 # DSL layer type -> torch.nn class (Section 3.3/3.4 of the spec).
 PYTORCH_CLASS_MAP = {
@@ -321,23 +317,48 @@ class CodeGenerator:
                 lines.append(f"{var} = torch.chunk({src_expr}, {chunks}, dim={dim})")
 
             else:
-                # Regular stateful layer -- exactly one input tensor.
-                # Only Add/Concat/Residual/Split accept multiple inputs;
-                # nothing currently stops a user from wiring two edges
-                # into a Linear node, so this is checked here rather
-                # than assumed.
-                if len(preds) != 1:
-                    raise CodegenError(
-                        f"Node '{node_id}' ({node.layer_type}, line "
-                        f"{node.line}) has {len(preds)} incoming edges; "
-                        f"a {node.layer_type} layer takes exactly one "
-                        f"input. SemanticAnalyzer does not currently "
-                        f"check fan-in arity for anything except "
-                        f"Residual -- recommend generalizing that check "
-                        f"to every non-structural layer type."
-                    )
-                arg = self._predecessor_expr(preds[0])
-                lines.append(f"{var} = self.{var}({arg})")
+                # Regular stateful layer. Fan-in of exactly 1 is the
+                # common case, but fan-in > 1 is valid DSL too --
+                # Section 4's Transformer Encoder example wires two
+                # edges into a plain LayerNorm node (a residual
+                # connection) and its generated code sums them before
+                # the call: `x = self.norm1(x + attn_out)`.
+                # SemanticAnalyzer emits a WARNING for this case (not
+                # an error, since it's valid), see
+                # _check_implicit_sum_fanin there. Summing is handled
+                # the same way regardless of fan-in count: joining a
+                # single-element list with ' + ' just yields that one
+                # element unchanged, so this one code path covers both.
+                #
+                # Fan-in == 0 is NOT possible here and isn't checked:
+                # SemanticAnalyzer's reachability check already
+                # guarantees every non-input node reachable from input
+                # has at least one incoming edge (the last hop of
+                # whatever path proved it reachable), and codegen only
+                # ever runs on a program that passed that check with
+                # zero errors.
+                exprs = [self._predecessor_expr(e) for e in preds]
+                arg = " + ".join(exprs)
+
+                if node.layer_type == "MultiHeadAttn":
+                    # Self-attention per Section 6.3: query=key=value.
+                    # Real nn.MultiheadAttention returns (output,
+                    # attn_weights) -- the weights are discarded here,
+                    # matching the spec's own generated pattern
+                    # (`attn_out, _ = self.attn(x, x, x)`). Missing
+                    # this unpack was a pre-existing bug: without it,
+                    # `var` would be bound to the whole 2-tuple instead
+                    # of just the output tensor, silently breaking
+                    # every layer downstream of it.
+                    lines.append(f"{var}, _ = self.{var}({arg}, {arg}, {arg})")
+                elif node.layer_type in ("LSTM", "GRU"):
+                    # Real nn.LSTM/nn.GRU also return (output,
+                    # hidden_state) -- hidden state discarded per
+                    # Section 6.3 ("hidden state discarded by
+                    # default"). Same pre-existing bug as MultiHeadAttn.
+                    lines.append(f"{var}, _ = self.{var}({arg})")
+                else:
+                    lines.append(f"{var} = self.{var}({arg})")
 
         output_var = _safe_identifier(self.program.model.output)
         lines.append(f"return {output_var}")

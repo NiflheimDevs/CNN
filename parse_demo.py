@@ -98,7 +98,11 @@ def main(path: str) -> None:
 
     # show_ast(program)
 
-    errors = SemanticAnalyzer(program).analyze()
+
+    sem = SemanticAnalyzer(program)
+    errors = sem.analyze()
+    dignostic = sem.to_diagnostics()
+
     if errors:
         for err in errors:
             print(f"[semantic error] {err.message}"
