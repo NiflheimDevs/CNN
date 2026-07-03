@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from nngraph.ast_nodes import Program, GraphNode, Edge
 from nngraph.diagnostics import Diagnostic, Severity
 from nngraph.layer_catalogue import STRUCTURAL_OPS
+from nngraph.graph_utils import topological_order, GraphCycleError
+from nngraph.shape_inference import infer_shapes, Shape
 
 
 @dataclass
@@ -40,6 +42,22 @@ class SemanticAnalyzer:
         self.adjacency: dict[str, list[str]] = {}
         self.incoming_count: dict[str, int] = {}
 
+        # Edge-keyed (not just node-id-keyed) adjacency, preserving
+        # declaration order -- needed by topological_order() and by
+        # shape inference, neither of which the plain `adjacency`
+        # dict above is sufficient for: topological_order needs actual
+        # Edge objects to walk (see graph_utils.py), and shape
+        # inference needs to know, for a node with multiple incoming
+        # edges, which shapes are arriving in which declared order.
+        self.incoming_edges: dict[str, list[Edge]] = {}
+        self.outgoing_edges: dict[str, list[Edge]] = {}
+
+        # node_id -> inferred shape, or None if unknown/undetermined.
+        # Populated by _infer_shapes(); stays empty if shape inference
+        # was skipped because an earlier structural error made the
+        # graph unsafe to walk (see _infer_shapes() itself).
+        self.shapes: dict[str, Shape | None] = {}
+
     def analyze(self) -> list[SemanticError]:
         self._collect_nodes()
         self._validate_edges()
@@ -48,14 +66,25 @@ class SemanticAnalyzer:
         self._check_residual_arity()
         self._check_implicit_sum_fanin()
         self._check_param_types()
-        self._check_required_params()
+        # Reachability and acyclicity now run BEFORE the required-param
+        # check (they used to run after it) -- shape inference needs a
+        # confirmed-acyclic, confirmed-reference-valid graph to safely
+        # topologically sort and walk, and it has to run before the
+        # required-param check so that params it successfully infers
+        # (in_features, in_ch, ...) are already present by the time
+        # that check looks for them. Moving reachability/acyclic
+        # earlier was the smallest reordering that achieves that,
+        # since shape inference depends on both anyway.
         self._check_reachability()
         self._check_acyclic()
+        self._infer_shapes()
+        self._check_required_params()
         # Normalization runs last and unconditionally. Even if a node
         # had an error (e.g. an unknown extra param), whatever known
-        # params it DOES have are still safe to rename -- the unknown
-        # ones are left untouched and harmless, since a caller is
-        # expected to gate codegen behind an empty error list anyway.
+        # params it DOES have -- including ones _infer_shapes just
+        # filled in -- are still safe to rename -- the unknown ones
+        # are left untouched and harmless, since a caller is expected
+        # to gate codegen behind an empty error list anyway.
         self._normalize_param_names()
         return self.errors
 
@@ -123,6 +152,14 @@ class SemanticAnalyzer:
                 self.adjacency[e.src].append(e.dst)
             if e.dst in self.incoming_count:
                 self.incoming_count[e.dst] += 1
+            # Built regardless of whether src/dst resolved -- an edge
+            # referencing an undefined node already produced an error
+            # above, and topological_order()/shape inference are both
+            # gated on zero errors before they ever run (see
+            # _infer_shapes), so a stray entry keyed on a bad id here
+            # is harmless dead data, not a correctness risk.
+            self.outgoing_edges.setdefault(e.src, []).append(e)
+            self.incoming_edges.setdefault(e.dst, []).append(e)
 
     # ---- output resolves against graph.nodes ------------------------------
     def _check_output_resolves(self):
@@ -248,6 +285,20 @@ class SemanticAnalyzer:
     # Params listed in EXPECTED_PARAM_TYPES that are NOT required --
     # anything for a given layer_type that's absent from this set (but
     # present in EXPECTED_PARAM_TYPES) is required.
+    #
+    # Note what's deliberately NOT here: in_features, in_ch,
+    # num_features, normalized_shape, embed_dim, input_size (see
+    # INFERABLE_PARAM in layer_catalogue.py) are all omittable in
+    # valid DSL now that _infer_shapes() exists, but they're still
+    # untouched here. That's not an oversight -- _infer_shapes() runs
+    # BEFORE _check_required_params() in analyze() and, when it
+    # successfully infers one of these, writes it directly into
+    # node.params. By the time _check_required_params looks for it,
+    # it's simply already there. If inference *couldn't* fill it
+    # (e.g. shape was lost downstream of a Flatten), it's genuinely
+    # still missing and this check is right to flag it -- so no
+    # separate "optional if inferable" concept needs to exist here at
+    # all; the ordering alone makes it work.
     OPTIONAL_PARAMS: dict[str, set[str]] = {
         "Linear": {"bias"},
         "Flatten": {"start_dim", "end_dim"},
@@ -263,6 +314,44 @@ class SemanticAnalyzer:
         "MaxPool2d": {"kernel": "kernel_size"},
         "AvgPool2d": {"kernel": "kernel_size"},
     }
+
+    # ---- Shape inference ----------------------------------------------------
+    def _infer_shapes(self):
+        """Runs shape propagation (nngraph/shape_inference.py) over the
+        graph: auto-fills inferable params (see INFERABLE_PARAM in
+        layer_catalogue.py) directly into each node's params dict, and
+        reports genuine shape mismatches as errors through the same
+        self.errors list everything else uses.
+
+        Skipped entirely if any ERROR-severity diagnostic already
+        exists. Undefined references or a cycle make the graph unsafe
+        to topologically sort at all -- there's no point computing
+        shapes over a graph that's already going to be rejected, and
+        attempting it could produce a second, confusing wave of
+        errors on top of the real problem.
+
+        shape_inference.py deliberately doesn't know about
+        SemanticError -- it reports through a plain callback so it
+        never has to import this module (which would create a cycle,
+        since this method is what imports and calls it). The lambda
+        below is the only place that translates between the two.
+        """
+        if any(e.severity is Severity.ERROR for e in self.errors):
+            return
+        try:
+            order = topological_order(self.program, self.outgoing_edges)
+        except GraphCycleError:
+            # Should be unreachable -- _check_acyclic() already ran
+            # (see the ordering in analyze()) and found nothing,
+            # which is exactly the condition the guard above checks.
+            # Defensive only, same invariant-assertion philosophy as
+            # codegen.py's own defensive checks.
+            return
+        self.shapes = infer_shapes(
+            self.program, self.nodes, order, self.incoming_edges,
+            report_error=lambda msg, node_id, line, severity: self.errors.append(
+                SemanticError(msg, node_id, line, severity=severity)),
+        )
 
     # ---- Parameter type checking ----------------------------------------
     def _check_param_types(self):
@@ -364,37 +453,23 @@ class SemanticAnalyzer:
         return visited
 
     # ---- Cycle detection (DAG check) --------------------------------------
-    def _check_acyclic(self) -> None:
-        """Cycle detection via Kahn's algorithm.
+    def _check_acyclic(self):
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {n: WHITE for n in self.adjacency}
 
-        As a side effect this also produces a valid topological order
-        (self._topo_order), which _run_shape_inference() reuses directly —
-        so we only ever run one O(V+E) pass instead of DFS-cycle-check +
-        separate Kahn's-topo-sort.
-        """
-        in_degree = {n: 0 for n in self.adjacency}
-        for src, neighbors in self.adjacency.items():
-            for dst in neighbors:
-                in_degree[dst] = in_degree.get(dst, 0) + 1
-
-        queue = [n for n, deg in in_degree.items() if deg == 0]
-        order: list[str] = []
-        while queue:
-            node_id = queue.pop(0)
-            order.append(node_id)
+        def visit(node_id):
+            color[node_id] = GRAY
             for neighbor in self.adjacency.get(node_id, []):
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
+                if neighbor not in color:
+                    continue
+                if color[neighbor] == GRAY:
+                    self.errors.append(SemanticError(
+                        f"Cycle detected involving node '{neighbor}'",
+                        neighbor))
+                elif color[neighbor] == WHITE:
+                    visit(neighbor)
+            color[node_id] = BLACK
 
-        if len(order) != len(self.adjacency):
-            # Every node still holding in-degree > 0 is part of, or only
-            # reachable through, a cycle.
-            stuck = [n for n in self.adjacency if n not in order]
-            for node_id in stuck:
-                self.errors.append(
-                    SemanticError(f"Cycle detected involving node '{node_id}'", node_id)
-                )
-            self._topo_order = None  # order is meaningless if a cycle exists
-        else:
-            self._topo_order = order
+        for node_id in self.adjacency:
+            if color[node_id] == WHITE:
+                visit(node_id)

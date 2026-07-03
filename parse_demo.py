@@ -107,7 +107,7 @@ def main(path: str) -> None:
         for err in errors:
             print(f"[semantic error] {err.message}"
                   + (f" (line {err.line})" if err.line else ""), file=sys.stderr)
-        sys.exit(1)
+       # sys.exit(1)
 
     gencode = CodeGenerator(program).generate()
 

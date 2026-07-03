@@ -30,6 +30,7 @@ confusing KeyError three lines later.
 import keyword
 
 from nngraph.ast_nodes import Edge, GraphNode, Program
+from nngraph.graph_utils import GraphCycleError, topological_order
 from nngraph.layer_catalogue import STRUCTURAL_OPS
 
 
@@ -161,45 +162,22 @@ class CodeGenerator:
         return "\n".join(lines) + "\n"
 
     # ------------------------------------------------------------
-    # Topological sort (Kahn's algorithm), declaration-order tie-break
+    # Topological sort -- delegates to graph_utils.topological_order,
+    # the same function shape_inference.py now uses. Kept as a thin
+    # method here (rather than calling the shared function directly at
+    # the one call site in generate()) only so CodegenError stays the
+    # single exception type this module's public surface raises --
+    # GraphCycleError is an implementation detail of graph_utils, not
+    # something a caller of CodeGenerator should need to know exists.
     # ------------------------------------------------------------
     def _topological_order(self) -> list[str]:
-        # Declaration index makes ready-queue tie-breaking
-        # deterministic: two structurally-equivalent graphs whose
-        # branches are just listed in a different source order should
-        # not produce differently-ordered forward() bodies between
-        # compiler runs. The virtual input node is always index -1,
-        # ahead of every real graph node.
-        decl_index = {self.input_id: -1}
-        for i, n in enumerate(self.program.graph.nodes):
-            decl_index[n.id] = i
-
-        in_degree = {node_id: 0 for node_id in decl_index}
-        for edge in self.program.graph.edges:
-            in_degree[edge.dst] = in_degree.get(edge.dst, 0) + 1
-
-        ready = [node_id for node_id, deg in in_degree.items() if deg == 0]
-        order: list[str] = []
-        while ready:
-            ready.sort(key=lambda node_id: decl_index[node_id])
-            current = ready.pop(0)
-            order.append(current)
-            for edge in self.outgoing.get(current, []):
-                in_degree[edge.dst] -= 1
-                if in_degree[edge.dst] == 0:
-                    ready.append(edge.dst)
-
-        if len(order) != len(decl_index):
-            # The cycle check in semantic analysis should already have
-            # rejected this program -- this is a defensive backstop,
-            # not the primary detection path, and should be unreachable
-            # in practice if Phase 3 ran first.
-            raise CodegenError(
-                "Topological sort could not order all nodes -- the graph "
-                "still contains a cycle. This should already have been "
-                "rejected by SemanticAnalyzer._check_acyclic()."
-            )
-        return order
+        try:
+            return topological_order(self.program, self.outgoing)
+        except GraphCycleError as e:
+            # Should already be unreachable -- SemanticAnalyzer.
+            # _check_acyclic() ran during Phase 3 and found nothing.
+            # Defensive backstop, not the primary detection path.
+            raise CodegenError(str(e)) from e
 
     # ------------------------------------------------------------
     # __init__ body -- declaration order, skipping structural ops
@@ -415,9 +393,13 @@ class CodeGenerator:
             f"    print(model({input_var}).shape)",
             # Deliberately no inferred-shape trailing comment here
             # (the spec's own example has "# -> torch.Size([64, 10])").
-            # Producing that requires propagating shapes through every
-            # layer, which Section 9 lists as future work (shape
-            # inference) -- out of scope for Phase 4.
+            # SemanticAnalyzer now DOES compute this (self.shapes,
+            # populated by _infer_shapes()) -- CodeGenerator just isn't
+            # wired up to consume it yet. That's a small, mechanical
+            # follow-up (thread `shapes: dict[str, Shape | None]`
+            # through CodeGenerator.__init__, look up
+            # shapes[program.model.output] here), not a fundamental
+            # gap the way it was before this session.
         ]
 
 

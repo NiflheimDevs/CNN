@@ -10,7 +10,7 @@ node drop1   : Dropout(p=0.1)
 node norm1   : LayerNorm(normalized_shape=(128))
 // Feed-forward sub-layer
 node ff1
-: Linear(in_features=128, out_features=512)
+: Linear(out_features=512)
 node gelu1   : GELU()
 node drop2   : Dropout(p=0.1)
 node ff2
