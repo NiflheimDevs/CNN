@@ -1,0 +1,42 @@
+{
+  "name": "nngraph-language-support",
+  "displayName": "NNGraph Language Support",
+  "description": "Diagnostics and syntax highlighting for NNGraph files.",
+  "version": "0.1.0",
+  "publisher": "nngraph",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:nngraph"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [{
+      "id": "nngraph",
+      "aliases": ["NNGraph", "nngraph"],
+      "extensions": [".nng"],
+      "configuration": "./language-configuration.json",
+      "firstLine": "^model\\s"
+    }],
+    "grammars": [{
+      "language": "nngraph",
+      "scopeName": "source.nngraph",
+      "path": "./syntaxes/nngraph.tmLanguage.json"
+    }],
+    "configuration": {
+      "title": "NNGraph",
+      "properties": {
+        "nngraph.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to launch the NNGraph language server."
+        }
+      }
+    }
+  },
+  "scripts": { "compile": "tsc -p ./", "vscode:prepublish": "npm run compile" },
+  "dependencies": { "vscode-languageclient": "^9.0.1" },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  }
+}
