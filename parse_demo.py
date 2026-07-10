@@ -115,5 +115,5 @@ def main(path: str) -> None:
 
 
 if __name__ == "__main__":
-    path = "./mlp4.nng"
+    path = "./mlp.nng"
     main(path)

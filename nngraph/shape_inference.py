@@ -17,6 +17,23 @@ InputDecl.shape's existing convention -- config.batch_size is a
 wholly separate, independently-specified concern applied only in the
 generated __main__ scaffold.
 
+IMPORTANT -- dim values are batch-inclusive, shapes are not: every
+`dim` parameter in the DSL (Concat's, Split's) is written the way
+you'd write it against the REAL runtime tensor, which PyTorch always
+gives an implicit batch axis at index 0. `Concat(dim=1)` on a real
+(batch, channels, H, W) tensor concatenates channels -- dim=1 IS the
+channel axis specifically because batch occupies dim=0. But this
+module's tracked shapes are (channels, H, W), with no batch axis at
+all, so dim=1 read directly against that tuple lands on H, not
+channels. _translate_dim() below converts a batch-inclusive dim into
+the correct index for a batch-less shape tuple (shift non-negative
+dims down by one; negative dims like dim=-1 need no shift, since
+"count from the end" is unaffected by however many leading axes
+exist). Every place that indexes a tracked shape using a DSL-provided
+dim value MUST go through _translate_dim() -- reading node.params["dim"]
+directly against a shape tuple is exactly the bug this paragraph
+exists to prevent someone from reintroducing.
+
 Flatten and Embedding are treated as shape-UNKNOWN rather than
 computed precisely. The spec's own worked examples are ambiguous
 about whether Flatten's start_dim/end_dim are meant to index the
@@ -309,6 +326,46 @@ def _apply_layer_rule(node: GraphNode, input_shape: Optional[Shape], report_erro
 # "must match" sum -- Concat merges along one dim, Split divides one)
 # ------------------------------------------------------------
 
+def _translate_dim(
+    dim: int, rank: int, node: GraphNode, op_name: str, report_error: ReportError
+) -> Optional[int]:
+    """Converts a DSL `dim` value (written assuming the batch-included
+    runtime tensor) into the correct index into a batch-less shape
+    tuple of the given rank. See the module docstring's "dim values
+    are batch-inclusive" section for the full reasoning -- summary:
+    dim=1 in the DSL means channel-axis-of-a-4D-tensor, which is index
+    0 of our 3D (C, H, W) tuple, so non-negative dims shift down by
+    one; dim=-1 ("last axis") needs no shift at all.
+
+    Returns None (after reporting an error) if dim==0 -- the batch
+    axis itself, not a valid target for a per-sample operation in a
+    DSL whose tracked shapes don't model batch at all -- or if the
+    translated index is out of range for `rank`.
+    """
+    if dim == 0:
+        report_error(
+            f"Node '{node.id}': {op_name} dim=0 refers to the batch "
+            f"dimension, which this DSL's shapes don't model (shapes "
+            f"are per-sample; batch only exists via config.batch_size "
+            f"in the generated __main__ scaffold). Did you mean dim=1, "
+            f"the first per-sample dimension?",
+            node.id, node.line, Severity.ERROR,
+        )
+        return None
+    adjusted = dim - 1 if dim > 0 else dim
+    if not (-rank <= adjusted < rank):
+        report_error(
+            f"Node '{node.id}': {op_name} dim={dim} is out of range. "
+            f"DSL dim values count the batch dimension (dim=1 is the "
+            f"first per-sample axis, dim=2 the second, ...), so "
+            f"dim={dim} refers to per-sample axis {adjusted}, but the "
+            f"per-sample shape here only has {rank} dimension(s).",
+            node.id, node.line, Severity.ERROR,
+        )
+        return None
+    return adjusted if adjusted >= 0 else adjusted + rank
+
+
 def _concat_shape(
     node: GraphNode, pred_shapes: list[Optional[Shape]], report_error: ReportError
 ) -> Optional[Shape]:
@@ -319,19 +376,9 @@ def _concat_shape(
     dim = node.params["dim"]
     first = pred_shapes[0]
     rank = len(first)
-    if not (-rank <= dim < rank):
-        report_error(
-            f"Node '{node.id}': Concat dim={dim} is out of range for "
-            f"shape {first}.", node.id, node.line, Severity.ERROR,
-        )
+    norm_dim = _translate_dim(dim, rank, node, "Concat", report_error)
+    if norm_dim is None:
         return UNKNOWN
-    # Normalize once, up front -- computing "everything after dim" via
-    # `dim + 1` only works for non-negative indices. With dim=-1 (a
-    # very normal thing to write, "last dimension"), `dim + 1 == 0`
-    # and `shape[0:]` silently returns the WHOLE shape instead of
-    # "everything after the last element" (which should be empty).
-    # Every slice below uses norm_dim, never the raw signed dim.
-    norm_dim = dim if dim >= 0 else dim + rank
     for s in pred_shapes[1:]:
         if len(s) != rank:
             report_error(
@@ -362,13 +409,9 @@ def _split_shape(
         return UNKNOWN
     chunks, dim = node.params["chunks"], node.params["dim"]
     rank = len(input_shape)
-    if not (-rank <= dim < rank):
-        report_error(
-            f"Node '{node.id}': Split dim={dim} is out of range for "
-            f"shape {input_shape}.", node.id, node.line, Severity.ERROR,
-        )
+    norm_dim = _translate_dim(dim, rank, node, "Split", report_error)
+    if norm_dim is None:
         return UNKNOWN
-    norm_dim = dim if dim >= 0 else dim + rank  # same negative-index fix as Concat above
     size = input_shape[norm_dim]
     if chunks <= 0 or size % chunks != 0:
         report_error(

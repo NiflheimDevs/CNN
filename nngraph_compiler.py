@@ -41,8 +41,8 @@ from pathlib import Path
 
 from antlr4 import CommonTokenStream, FileStream
 
-from generated.NNGraphLexer import NNGraphLexer
-from generated.NNGraphParser import NNGraphParser
+from gen.NNGraphLexer import NNGraphLexer
+from gen.NNGraphParser import NNGraphParser
 
 from nngraph.ast_builder import ASTBuilder
 from nngraph.codegen import CodegenError, generate
