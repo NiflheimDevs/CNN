@@ -431,14 +431,22 @@ class SemanticAnalyzer:
         reachable = self._bfs(self.adjacency, input_name)
 
         for node_id in self.nodes:
+            if node_id == output:
+                continue  # reported below with a more specific message
             if node_id not in reachable:
                 self.errors.append(SemanticError(
                     f"Node '{node_id}' is not reachable from input "
                     f"'{input_name}'", node_id, self.nodes[node_id].line))
 
-        if output not in reachable and output != input_name:
+        if (output not in reachable and output != input_name
+                and output in self.valid_ids):
+            # If output isn't even a valid id, _check_output_resolves()
+            # already reported that -- don't pile on a second, confusing
+            # "not reachable" error for a node that doesn't exist.
             self.errors.append(SemanticError(
-                f"Output '{output}' is not reachable from input"))
+                f"Output '{output}' is not reachable from input "
+                f"'{input_name}'", output,
+                self.nodes[output].line if output in self.nodes else None))
 
     @staticmethod
     def _bfs(adjacency: dict, start: str) -> set:
